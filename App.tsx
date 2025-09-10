@@ -1,6 +1,8 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Direction, CellType, GameState, Position, Pacman, Ghost } from './types';
 import { TILE_SIZE, GAME_SPEED, FRIGHTENED_DURATION, BOARD_WIDTH, BOARD_HEIGHT, INITIAL_BOARD, TOTAL_PELLETS } from './constants';
+import { GoogleGenAI, Type } from "@google/genai";
 
 const INITIAL_PACMAN_POSITION: Position = { x: 13, y: 19 };
 const INITIAL_GHOSTS: Ghost[] = [
@@ -57,7 +59,7 @@ const findNextMove = (board: CellType[][], start: Position, end: Position, ghost
 
     for (const dir of [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT]) {
         const nextPos = getNextPosition(start, dir);
-        if (nextPos.y < 0 || nextPos.y >= BOARD_HEIGHT) continue;
+        if (nextPos.y < 0 || nextPos.y >= BOARD_HEIGHT || nextPos.x < 0 || nextPos.x >= BOARD_WIDTH) continue;
         
         const cell = board[nextPos.y]?.[nextPos.x];
         if (cell === CellType.WALL) continue;
@@ -140,7 +142,9 @@ const getChaseTarget = (ghost: Ghost, pacman: Pacman, ghosts: Ghost[]): Position
     }
 };
 
-const GameOverlay: React.FC<{ gameState: GameState; score: number; lives: number; onStart: () => void; }> = ({ gameState, score, lives, onStart }) => {
+type HiveMindStatus = 'offline' | 'thinking' | 'active' | 'error';
+
+const GameOverlay: React.FC<{ gameState: GameState; score: number; lives: number; onStart: () => void; hiveMindStatus: HiveMindStatus; }> = ({ gameState, score, lives, onStart, hiveMindStatus }) => {
   const message = useMemo(() => {
     switch (gameState) {
       case GameState.READY: return "Press Enter to Start";
@@ -150,9 +154,21 @@ const GameOverlay: React.FC<{ gameState: GameState; score: number; lives: number
     }
   }, [gameState]);
 
+  const hiveMindColor = useMemo(() => {
+    switch (hiveMindStatus) {
+      case 'active': return 'text-purple-400';
+      case 'thinking': return 'text-yellow-400 animate-pulse';
+      case 'error': return 'text-red-500';
+      default: return 'text-gray-500';
+    }
+  }, [hiveMindStatus]);
+
   return (
     <>
       <div className="absolute top-2 left-2 text-white font-bold text-lg z-20">SCORE: {score}</div>
+      <div className="absolute top-8 left-2 text-white font-bold text-sm z-20">
+        HIVE-MIND: <span className={hiveMindColor}>{hiveMindStatus.toUpperCase()}</span>
+      </div>
       <div className="absolute top-2 right-2 text-yellow-400 font-bold text-lg z-20 flex items-center">
         LIVES: 
         {Array.from({ length: lives }).map((_, i) => (
@@ -168,7 +184,12 @@ const GameOverlay: React.FC<{ gameState: GameState; score: number; lives: number
   );
 };
 
-const Character: React.FC<{ type: 'pacman' | 'ghost'; data: Pacman | Ghost; isFrightened?: boolean; }> = ({ type, data, isFrightened }) => {
+const Character: React.FC<{
+  type: 'pacman' | 'ghost';
+  data: Pacman | Ghost;
+  isFrightened?: boolean;
+  isHiveMindControlled?: boolean;
+}> = ({ type, data, isFrightened, isHiveMindControlled }) => {
     const { position, direction } = data;
 
     const rotationClass = useMemo(() => {
@@ -194,6 +215,12 @@ const Character: React.FC<{ type: 'pacman' | 'ghost'; data: Pacman | Ghost; isFr
     const ghostData = data as Ghost;
     const isEaten = ghostData.state === 'eaten';
     
+    const colorClass = isFrightened
+        ? 'bg-blue-700 animate-pulse'
+        : isHiveMindControlled
+        ? 'bg-purple-600 animate-pulse'
+        : ghostData.color;
+
     return (
         <div className="absolute w-6 h-6 transition-all duration-100 ease-linear" style={{ top: position.y * TILE_SIZE, left: position.x * TILE_SIZE }}>
             {isEaten ? (
@@ -202,7 +229,7 @@ const Character: React.FC<{ type: 'pacman' | 'ghost'; data: Pacman | Ghost; isFr
                     <div className="w-2 h-2 bg-white rounded-full"></div>
                 </div>
             ) : (
-                <div className={`w-full h-full rounded-t-full relative ${isFrightened ? 'bg-blue-700 animate-pulse' : ghostData.color}`}>
+                <div className={`w-full h-full rounded-t-full relative ${colorClass}`}>
                     <div className="absolute flex w-full justify-center top-1/4">
                         <div className="w-2 h-2 bg-white rounded-full mr-0.5 relative"><div className="w-1 h-1 bg-black rounded-full absolute top-0.5 left-0.5"></div></div>
                         <div className="w-2 h-2 bg-white rounded-full ml-0.5 relative"><div className="w-1 h-1 bg-black rounded-full absolute top-0.5 left-0.5"></div></div>
@@ -248,6 +275,25 @@ const App = () => {
   const [modeTicks, setModeTicks] = useState(GHOST_MODE_SCHEDULE[0].duration / GAME_SPEED);
   const [scheduleIndex, setScheduleIndex] = useState(0);
 
+  const [hiveMindStatus, setHiveMindStatus] = useState<HiveMindStatus>('offline');
+  const [geminiTargets, setGeminiTargets] = useState<Record<number, Position> | null>(null);
+  const geminiAi = useMemo(() => {
+    try {
+        // More robust check for API_KEY to prevent crashes on load
+        if (typeof process === 'object' && process !== null && process.env && typeof process.env.API_KEY === 'string' && process.env.API_KEY) {
+            return new GoogleGenAI({ apiKey: process.env.API_KEY });
+        }
+    } catch (e) {
+        console.error("Failed to initialize GoogleGenAI, Hive-Mind will be disabled:", e);
+    }
+    return null;
+  }, []);
+
+  const pacmanRef = useRef(pacman);
+  pacmanRef.current = pacman;
+  const ghostsRef = useRef(ghosts);
+  ghostsRef.current = ghosts;
+
   const resetLevel = useCallback(() => {
     setPacman({ position: INITIAL_PACMAN_POSITION, direction: Direction.RIGHT, nextDirection: Direction.RIGHT, isMouthOpen: true });
     setGhosts(JSON.parse(JSON.stringify(INITIAL_GHOSTS)));
@@ -264,6 +310,8 @@ const App = () => {
     setGhostMode(GHOST_MODE_SCHEDULE[0].mode as 'chase' | 'scatter');
     setModeTicks(GHOST_MODE_SCHEDULE[0].duration / GAME_SPEED);
     setGameState(GameState.READY);
+    setHiveMindStatus('offline');
+    setGeminiTargets(null);
   }, [resetLevel]);
   
   const startGame = useCallback(() => {
@@ -293,6 +341,68 @@ const App = () => {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [startGame]);
+  
+  const callHiveMind = useCallback(async () => {
+    if (!geminiAi || ghostMode !== 'chase') return;
+    setHiveMindStatus('thinking');
+    
+    const currentPacman = pacmanRef.current;
+    const currentGhosts = ghostsRef.current;
+
+    const prompt = `You are a master strategist for the ghosts in Pac-Man. Your goal is to coordinate the 4 ghosts to trap and capture Pac-Man. The maze is ${BOARD_WIDTH}x${BOARD_HEIGHT} (x from 0 to ${BOARD_WIDTH-1}, y from 0 to ${BOARD_HEIGHT-1}). Pac-Man is at (${currentPacman.position.x}, ${currentPacman.position.y}). The ghosts are at: Blinky (ID 1): (${currentGhosts[0].position.x}, ${currentGhosts[0].position.y}), Pinky (ID 2): (${currentGhosts[1].position.x}, ${currentGhosts[1].position.y}), Inky (ID 3): (${currentGhosts[2].position.x}, ${currentGhosts[2].position.y}), Clyde (ID 4): (${currentGhosts[3].position.x}, ${currentGhosts[3].position.y}). Your task is to provide the optimal target coordinates (x, y) for each ghost to work together as a team to corner Pac-Man. Return only a valid JSON object with targets for each ghost ID.`;
+
+    try {
+        const response = await geminiAi.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: prompt,
+            config: {
+                responseMimeType: "application/json",
+                responseSchema: {
+                    type: Type.OBJECT,
+                    properties: {
+                        '1': { type: Type.OBJECT, properties: { x: { type: Type.INTEGER }, y: { type: Type.INTEGER } }, required: ['x', 'y'] },
+                        '2': { type: Type.OBJECT, properties: { x: { type: Type.INTEGER }, y: { type: Type.INTEGER } }, required: ['x', 'y'] },
+                        '3': { type: Type.OBJECT, properties: { x: { type: Type.INTEGER }, y: { type: Type.INTEGER } }, required: ['x', 'y'] },
+                        '4': { type: Type.OBJECT, properties: { x: { type: Type.INTEGER }, y: { type: Type.INTEGER } }, required: ['x', 'y'] },
+                    },
+                },
+            },
+        });
+        
+        const jsonText = response.text.trim();
+        const targets = JSON.parse(jsonText);
+        
+        if (targets && targets['1'] && targets['2'] && targets['3'] && targets['4']) {
+            setGeminiTargets(targets);
+            setHiveMindStatus('active');
+
+            setTimeout(() => {
+                setGeminiTargets(null);
+                setHiveMindStatus(s => s === 'active' ? 'offline' : s);
+            }, 10000); // Active for 10 seconds
+        } else {
+            throw new Error("Invalid target format received from AI.");
+        }
+    } catch (error) {
+        console.error("Hive-mind error:", error);
+        setHiveMindStatus('error');
+        setTimeout(() => {
+            setHiveMindStatus(s => s === 'error' ? 'offline' : s);
+        }, 5000);
+    }
+  }, [geminiAi, ghostMode]);
+  
+  useEffect(() => {
+    if (gameState !== GameState.PLAYING || !geminiAi) {
+      if(hiveMindStatus !== 'offline') setHiveMindStatus('offline');
+      return;
+    }
+    
+    const intervalId = setInterval(callHiveMind, 15000); // Call every 15s
+    callHiveMind();
+
+    return () => clearInterval(intervalId);
+  }, [gameState, geminiAi, callHiveMind]);
 
   const movePacman = useCallback(() => {
     setPacman(p => {
@@ -349,9 +459,14 @@ const App = () => {
         }
 
         // NORMAL mode (Chase or Scatter)
-        let targetPos = ghostMode === 'chase'
-            ? getChaseTarget(ghost, pacman, currentGhosts)
-            : ghost.scatterTarget;
+        let targetPos;
+        if (ghostMode === 'chase' && geminiTargets && geminiTargets[ghost.id]) {
+            targetPos = geminiTargets[ghost.id];
+        } else {
+             targetPos = ghostMode === 'chase'
+                ? getChaseTarget(ghost, pacman, currentGhosts)
+                : ghost.scatterTarget;
+        }
         
         let bestDir = findNextMove(board, ghost.position, targetPos, ghost.state);
 
@@ -360,27 +475,30 @@ const App = () => {
         const newPosition = getNextPosition(ghost.position, bestDir ?? ghost.direction);
         return { ...ghost, position: newPosition, direction: bestDir ?? ghost.direction };
     }));
-  }, [board, pacman, ghostMode]);
+  }, [board, pacman, ghostMode, geminiTargets]);
   
   const handleCollisions = useCallback(() => {
-    ghosts.forEach(ghost => {
-        if (ghost.position.x === pacman.position.x && ghost.position.y === pacman.position.y) {
-            if (ghost.state === 'frightened') {
-                setScore(s => s + 200);
-                setGhosts(gs => gs.map(g => g.id === ghost.id ? { ...g, state: 'eaten' } : g));
-            } else if(ghost.state === 'normal') {
-                setLives(l => l - 1);
-                if (lives - 1 > 0) {
-                    resetLevel();
-                    setGameState(GameState.PAUSED);
-                    setTimeout(() => setGameState(GameState.PLAYING), 1000);
-                } else {
-                    setGameState(GameState.GAME_OVER);
-                }
-            }
+    // Check for ghost collisions
+    let pacmanHasDied = false;
+    for (const ghost of ghosts) {
+      if (ghost.position.x === pacman.position.x && ghost.position.y === pacman.position.y) {
+        if (ghost.state === 'frightened') {
+          setScore(s => s + 200);
+          setGhosts(gs => gs.map(g => (g.id === ghost.id ? { ...g, state: 'eaten' } : g)));
+        } else if (ghost.state === 'normal') {
+          pacmanHasDied = true;
+          break; // Exit loop on first fatal collision to prevent multiple life loss
         }
-    });
+      }
+    }
 
+    if (pacmanHasDied) {
+      setLives(l => l - 1);
+      setGameState(GameState.PAUSED); // Pause game, let useEffect handle reset
+      return; 
+    }
+
+    // Check for pellet collisions (only if not dead)
     const cellUnderPacman = board[pacman.position.y]?.[pacman.position.x];
     if (cellUnderPacman === CellType.PELLET || cellUnderPacman === CellType.POWER_PELLET) {
         if (cellUnderPacman === CellType.PELLET) {
@@ -405,7 +523,21 @@ const App = () => {
         newBoard[pacman.position.y][pacman.position.x] = CellType.EMPTY;
         setBoard(newBoard);
     }
-  }, [pacman.position, ghosts, board, lives, resetLevel]);
+  }, [pacman, ghosts, board]);
+
+  // Handles the game state transitions after losing a life or winning.
+  useEffect(() => {
+    if (lives <= 0 && gameState !== GameState.GAME_OVER) {
+      setGameState(GameState.GAME_OVER);
+    } else if (gameState === GameState.PAUSED && lives > 0) {
+      // This pause is specifically for when a life is lost.
+      const timer = setTimeout(() => {
+        resetLevel();
+        setGameState(GameState.PLAYING);
+      }, 1000); // 1-second pause before reset
+      return () => clearTimeout(timer);
+    }
+  }, [lives, gameState, resetLevel]);
 
   useEffect(() => {
     if (eatenPellets > 0 && eatenPellets === TOTAL_PELLETS) {
@@ -453,7 +585,7 @@ const App = () => {
             className="relative bg-blue-900 border-4 border-blue-500 rounded-lg overflow-hidden box-content"
             style={{ width: BOARD_WIDTH * TILE_SIZE, height: BOARD_HEIGHT * TILE_SIZE }}
         >
-            <GameOverlay gameState={gameState} score={score} lives={lives} onStart={startGame} />
+            <GameOverlay gameState={gameState} score={score} lives={lives} onStart={startGame} hiveMindStatus={hiveMindStatus} />
 
             <div className="absolute top-0 left-0">
                 {board.map((row, y) =>
@@ -471,7 +603,13 @@ const App = () => {
 
             <Character type="pacman" data={pacman} />
             {ghosts.map(ghost => (
-                <Character key={ghost.id} type="ghost" data={ghost} isFrightened={ghost.state === 'frightened'} />
+                <Character 
+                    key={ghost.id} 
+                    type="ghost" 
+                    data={ghost} 
+                    isFrightened={ghost.state === 'frightened'} 
+                    isHiveMindControlled={hiveMindStatus === 'active' && ghost.state === 'normal'}
+                />
             ))}
         </div>
     </div>
