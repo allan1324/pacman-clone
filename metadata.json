@@ -1,0 +1,5 @@
+{
+  "name": "React Pac-Man",
+  "description": "A classic arcade game clone built with React, TypeScript, and Tailwind CSS. Navigate the maze, eat all the pellets, and avoid the ghosts!",
+  "requestFramePermissions": []
+}
