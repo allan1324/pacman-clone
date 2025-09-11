@@ -4,6 +4,12 @@ export const TILE_SIZE = 24;
 export const GAME_SPEED = 200; // ms per tick - increased for slower speed
 export const FRIGHTENED_DURATION = 40; // in ticks
 
+export const SCORES = {
+  PELLET: 10,
+  POWER_PELLET: 50,
+  GHOST_CHAIN: [200, 400, 800, 1600],
+};
+
 // 1 = wall, 0 = pellet, 2 = empty, 3 = power pellet, 4 = ghost home, 5 = ghost home door
 export const BOARD_LAYOUT_NUMERIC = [
     [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],

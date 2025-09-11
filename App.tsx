@@ -1,13 +1,13 @@
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Direction, CellType, GameState, Position, Pacman, Ghost } from './types';
-import { TILE_SIZE, GAME_SPEED, FRIGHTENED_DURATION, BOARD_WIDTH, BOARD_HEIGHT, INITIAL_BOARD, TOTAL_PELLETS } from './constants';
+import { TILE_SIZE, GAME_SPEED, FRIGHTENED_DURATION, BOARD_WIDTH, BOARD_HEIGHT, INITIAL_BOARD, TOTAL_PELLETS, SCORES } from './constants';
 import { GoogleGenAI, Type } from "@google/genai";
 
-const INITIAL_PACMAN_POSITION: Position = { x: 13, y: 19 };
+const INITIAL_PACMAN_POSITION: Position = { x: 13, y: 23 };
 const INITIAL_GHOSTS: Ghost[] = [
   // id: 1 => Blinky (Red) - The Chaser
-  { id: 1, position: { x: 13, y: 9 }, direction: Direction.LEFT, state: 'normal', color: 'bg-red-500', spawn: { x: 13, y: 9 }, scatterTarget: { x: BOARD_WIDTH - 2, y: 1 } },
+  { id: 1, position: { x: 13, y: 11 }, direction: Direction.LEFT, state: 'normal', color: 'bg-red-500', spawn: { x: 13, y: 11 }, scatterTarget: { x: BOARD_WIDTH - 2, y: 1 } },
   // id: 2 => Pinky (Pink) - The Ambusher
   { id: 2, position: { x: 13, y: 12 }, direction: Direction.UP, state: 'normal', color: 'bg-pink-500', spawn: { x: 13, y: 12 }, scatterTarget: { x: 1, y: 1 } },
   // id: 3 => Inky (Cyan) - The Flanker
@@ -304,13 +304,14 @@ const BoardCell: React.FC<{ cellType: CellType }> = React.memo(({ cellType }) =>
 
 const App = () => {
   const [board, setBoard] = useState<CellType[][]>(INITIAL_BOARD);
-  const [pacman, setPacman] = useState<Pacman>({ position: INITIAL_PACMAN_POSITION, direction: Direction.RIGHT, nextDirection: Direction.RIGHT, isMouthOpen: true });
+  const [pacman, setPacman] = useState<Pacman>({ position: INITIAL_PACMAN_POSITION, direction: Direction.LEFT, nextDirection: Direction.LEFT, isMouthOpen: true });
   const [ghosts, setGhosts] = useState<Ghost[]>(JSON.parse(JSON.stringify(INITIAL_GHOSTS)));
   const [gameState, setGameState] = useState<GameState>(GameState.READY);
   const [score, setScore] = useState(0);
   const [lives, setLives] = useState(3);
   const [eatenPellets, setEatenPellets] = useState(0);
   const [frightenedTicks, setFrightenedTicks] = useState(0);
+  const [ghostChain, setGhostChain] = useState(0);
 
   const [ghostMode, setGhostMode] = useState<'chase' | 'scatter'>('scatter');
   const [modeTicks, setModeTicks] = useState(GHOST_MODE_SCHEDULE[0].duration / GAME_SPEED);
@@ -342,7 +343,7 @@ const App = () => {
   ghostsRef.current = ghosts;
 
   const resetLevel = useCallback(() => {
-    setPacman({ position: INITIAL_PACMAN_POSITION, direction: Direction.RIGHT, nextDirection: Direction.RIGHT, isMouthOpen: true });
+    setPacman({ position: INITIAL_PACMAN_POSITION, direction: Direction.LEFT, nextDirection: Direction.LEFT, isMouthOpen: true });
     setGhosts(JSON.parse(JSON.stringify(INITIAL_GHOSTS)));
   }, []);
 
@@ -352,6 +353,7 @@ const App = () => {
     setLives(3);
     setEatenPellets(0);
     setFrightenedTicks(0);
+    setGhostChain(0);
     resetLevel();
     setScheduleIndex(0);
     setGhostMode(GHOST_MODE_SCHEDULE[0].mode as 'chase' | 'scatter');
@@ -573,7 +575,7 @@ const App = () => {
       newBoard[y][x] = CellType.EMPTY;
       setBoard(newBoard);
       
-      const points = cell === CellType.PELLET ? 10 : 50;
+      const points = cell === CellType.PELLET ? SCORES.PELLET : SCORES.POWER_PELLET;
       setScore(s => s + points);
       const newEatenPellets = eatenPellets + 1;
       setEatenPellets(newEatenPellets);
@@ -582,6 +584,7 @@ const App = () => {
           setFrightenedTicks(FRIGHTENED_DURATION);
           setGhosts(gs => gs.map(g => g.state !== 'eaten' ? { ...g, state: 'frightened' } : g));
           setGeminiTargets(null); // Disable hive-mind when Pac-Man is powered up
+          setGhostChain(0);
       }
       
       if (newEatenPellets === TOTAL_PELLETS) {
@@ -593,25 +596,32 @@ const App = () => {
     for (const ghost of ghosts) {
       if (ghost.position.x === x && ghost.position.y === y) {
         if (ghost.state === 'frightened') {
-          setScore(s => s + 200);
+          setScore(s => {
+            const award = SCORES.GHOST_CHAIN[Math.min(ghostChain, SCORES.GHOST_CHAIN.length - 1)];
+            return s + award;
+          });
+          setGhostChain(c => c + 1);
           setGhosts(gs => gs.map(g => g.id === ghost.id ? { ...g, state: 'eaten' } : g));
         } else if (ghost.state === 'normal' && gameStateRef.current === GameState.PLAYING) {
           setGameState(GameState.PAUSED); // Pause to prevent multiple life losses
-          setLives(l => l - 1);
-          if (lives - 1 <= 0) {
-            setGameState(GameState.GAME_OVER);
-          } else {
-            setTimeout(() => {
-                resetLevel();
-                setGameState(GameState.PLAYING);
-            }, 2000); // 2-second pause before resuming
-          }
+          setLives(currentLives => {
+              const newLives = currentLives - 1;
+              if (newLives <= 0) {
+                  setGameState(GameState.GAME_OVER);
+              } else {
+                  setTimeout(() => {
+                      resetLevel();
+                      setGameState(GameState.PLAYING);
+                  }, 2000); // 2-second pause before resuming
+              }
+              return newLives;
+          });
           break; // Exit loop after first collision
         }
       }
     }
 
-  }, [pacman.position, board, eatenPellets, ghosts, lives, resetLevel, gameState]);
+  }, [pacman.position, board, eatenPellets, ghosts, lives, resetLevel, gameState, ghostChain]);
 
 
   return (
