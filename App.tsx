@@ -50,14 +50,22 @@ const isWall = (pos: Position, board: CellType[][]): boolean => {
 };
 
 // A cell is blocked for a ghost depending on state.
-// - WALL is always blocked
-// - GHOST_HOME is blocked unless returning 'eaten'
-// - GHOST_HOME_DOOR is allowed only when 'eaten' (returning to spawn)
-const isBlockedForGhost = (pos: Position, board: CellType[][], state: Ghost['state']): boolean => {
-  const cell = board[pos.y]?.[pos.x];
-  if (cell === CellType.WALL) return true;
-  if (cell === CellType.GHOST_HOME && state !== 'eaten') return true;
-  if (cell === CellType.GHOST_HOME_DOOR && state !== 'eaten') return true;
+const isBlockedForGhost = (currentPos: Position, nextPos: Position, board: CellType[][], state: Ghost['state']): boolean => {
+  const nextCell = board[nextPos.y]?.[nextPos.x];
+  // Fix: Explicitly check for 'undefined' for out-of-bounds positions. The previous '!nextCell' check incorrectly treated 'CellType.WALL' (value 0) as falsy, causing a type error.
+  if (nextCell === undefined) return true; // Out of bounds
+  if (nextCell === CellType.WALL) return true;
+
+  const currentCell = board[currentPos.y]?.[currentPos.x];
+
+  // Ghosts can't enter the ghost home from outside, unless eaten.
+  const isEnteringGhostHome = 
+      (nextCell === CellType.GHOST_HOME || nextCell === CellType.GHOST_HOME_DOOR) &&
+      currentCell !== CellType.GHOST_HOME &&
+      currentCell !== CellType.GHOST_HOME_DOOR;
+      
+  if (isEnteringGhostHome && state !== 'eaten') return true;
+  
   return false;
 };
 
@@ -70,7 +78,7 @@ const safeGhostStep = (
 ): { pos: Position; dir: Direction } | null => {
   if (dir === Direction.NONE) return null;
   const nxt = getNextPosition(pos, dir);
-  if (isBlockedForGhost(nxt, board, state)) return null;
+  if (isBlockedForGhost(pos, nxt, board, state)) return null;
   return { pos: nxt, dir };
 };
 
@@ -98,11 +106,7 @@ const findNextMove = (board: CellType[][], start: Position, end: Position, ghost
 
     for (const dir of [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT]) {
         const nextPos = getNextPosition(start, dir);
-        if (nextPos.y < 0 || nextPos.y >= BOARD_HEIGHT || nextPos.x < 0 || nextPos.x >= BOARD_WIDTH) continue;
-        
-        const cell = board[nextPos.y]?.[nextPos.x];
-        if (cell === CellType.WALL) continue;
-        if (cell === CellType.GHOST_HOME && ghostState !== 'eaten') continue;
+        if (isBlockedForGhost(start, nextPos, board, ghostState)) continue;
         
         if (stringify(nextPos) === stringify(end)) return dir;
         queue.push({ pos: nextPos, firstStep: dir });
@@ -116,9 +120,7 @@ const findNextMove = (board: CellType[][], start: Position, end: Position, ghost
             const nextPos = getNextPosition(pos, dir);
             if (visited.has(stringify(nextPos))) continue;
 
-            const cell = board[nextPos.y]?.[nextPos.x];
-            if (cell === CellType.WALL) continue;
-            if (cell === CellType.GHOST_HOME && ghostState !== 'eaten') continue;
+            if (isBlockedForGhost(pos, nextPos, board, ghostState)) continue;
             
             if (stringify(nextPos) === stringify(end)) return firstStep;
             
@@ -479,16 +481,20 @@ const App = () => {
         const nextDir = findNextMove(board, ghost.position, ghost.spawn, ghost.state);
         const step = nextDir
           ? safeGhostStep(ghost.position, nextDir, board, ghost.state)
-          : tryGhostMoves(ghost.position, [opposite[ghost.direction], ghost.direction], board, ghost.state);
+          : tryGhostMoves(ghost.position, [opposite[ghost.direction], ghost.direction].filter(d => d !== Direction.NONE), board, ghost.state);
         return step ? { ...ghost, position: step.pos, direction: step.dir } : ghost;
       }
   
-      // 2) Frightened — bias away from Pac-Man but never into walls
+      // 2) Frightened — random move, but don't reverse if possible
       if (ghost.state === 'frightened') {
         const dirs: Direction[] = [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT];
-        // simple heuristic: prefer not to reverse unless forced
-        const prio = dirs.filter(d => d !== opposite[ghost.direction]).concat(opposite[ghost.direction]);
-        const step = tryGhostMoves(ghost.position, prio, board, ghost.state);
+        const allowedDirs = dirs.filter(dir => !isBlockedForGhost(ghost.position, getNextPosition(ghost.position, dir), board, ghost.state));
+        const nonReversingDirs = allowedDirs.filter(d => d !== opposite[ghost.direction]);
+
+        const moveCandidates = nonReversingDirs.length > 0 ? nonReversingDirs : allowedDirs;
+        const randomDir = moveCandidates[Math.floor(Math.random() * moveCandidates.length)] ?? Direction.NONE;
+        
+        const step = safeGhostStep(ghost.position, randomDir, board, ghost.state);
         return step ? { ...ghost, position: step.pos, direction: step.dir } : ghost;
       }
   
@@ -499,17 +505,22 @@ const App = () => {
   
       const bestDir = findNextMove(board, ghost.position, targetPos, ghost.state);
   
-      // Candidate order: bestDir, keep current, 90-degree turns, finally reverse
-      const turns = ghost.direction === Direction.UP || ghost.direction === Direction.DOWN
-        ? [Direction.LEFT, Direction.RIGHT]
-        : [Direction.UP, Direction.DOWN];
-  
-      const candidates: Direction[] = [];
-      if (bestDir) candidates.push(bestDir);
-      candidates.push(ghost.direction, ...turns, opposite[ghost.direction]);
-  
-      const step = tryGhostMoves(ghost.position, candidates, board, ghost.state);
+      // Don't allow reversing direction
+      const candidates: Direction[] = [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT]
+        .filter(d => d !== opposite[ghost.direction]);
+
+      if (bestDir && candidates.includes(bestDir)) {
+          // If best direction is valid (not reverse), move there.
+          const step = safeGhostStep(ghost.position, bestDir, board, ghost.state);
+          if (step) return { ...ghost, position: step.pos, direction: step.dir };
+      }
+      
+      // If bestDir is not an option, find any valid (non-reversing) move.
+      // Prioritize current direction to keep moving straight.
+      const moveOrder = [ghost.direction, ...candidates.filter(d => d !== ghost.direction)];
+      const step = tryGhostMoves(ghost.position, moveOrder, board, ghost.state);
       return step ? { ...ghost, position: step.pos, direction: step.dir } : ghost;
+
     }));
   }, [board, pacman, ghostMode, geminiTargets]);
   
