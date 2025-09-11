@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Direction, CellType, GameState, Position, Pacman, Ghost } from './types';
 import { TILE_SIZE, GAME_SPEED, FRIGHTENED_DURATION, BOARD_WIDTH, BOARD_HEIGHT, INITIAL_BOARD, TOTAL_PELLETS } from './constants';
@@ -46,6 +47,45 @@ const getNextPosition = (pos: Position, dir: Direction): Position => {
 const isWall = (pos: Position, board: CellType[][]): boolean => {
     const cell = board[pos.y]?.[pos.x];
     return cell === CellType.WALL || cell === CellType.GHOST_HOME || cell === CellType.GHOST_HOME_DOOR;
+};
+
+// A cell is blocked for a ghost depending on state.
+// - WALL is always blocked
+// - GHOST_HOME is blocked unless returning 'eaten'
+// - GHOST_HOME_DOOR is allowed only when 'eaten' (returning to spawn)
+const isBlockedForGhost = (pos: Position, board: CellType[][], state: Ghost['state']): boolean => {
+  const cell = board[pos.y]?.[pos.x];
+  if (cell === CellType.WALL) return true;
+  if (cell === CellType.GHOST_HOME && state !== 'eaten') return true;
+  if (cell === CellType.GHOST_HOME_DOOR && state !== 'eaten') return true;
+  return false;
+};
+
+// Safe one-tile step with validation. Returns new position + direction if allowed, else null.
+const safeGhostStep = (
+  pos: Position,
+  dir: Direction,
+  board: CellType[][],
+  state: Ghost['state']
+): { pos: Position; dir: Direction } | null => {
+  if (dir === Direction.NONE) return null;
+  const nxt = getNextPosition(pos, dir);
+  if (isBlockedForGhost(nxt, board, state)) return null;
+  return { pos: nxt, dir };
+};
+
+// Try a list of candidate directions in order and take the first legal step.
+const tryGhostMoves = (
+  pos: Position,
+  candidates: Direction[],
+  board: CellType[][],
+  state: Ghost['state']
+): { pos: Position; dir: Direction } | null => {
+  for (const d of candidates) {
+    const step = safeGhostStep(pos, d, board, state);
+    if (step) return step;
+  }
+  return null;
 };
 
 // BFS pathfinding function to find the next best move
@@ -412,73 +452,65 @@ const App = () => {
             currentDirection = p.nextDirection;
         }
 
-        const nextPos = getNextPosition(p.position, currentDirection);
-        if (isWall(nextPos, board)) {
-            return { ...p, isMouthOpen: !p.isMouthOpen }; // Chomp in place if blocked
+        const newPosition = getNextPosition(p.position, currentDirection);
+        // Guard: if somehow blocked (edge wrapping weirdness), don't move this tick
+        if (isWall(newPosition, board)) {
+          return { ...p, isMouthOpen: !p.isMouthOpen };
         }
-
-        return { ...p, position: nextPos, direction: currentDirection, isMouthOpen: !p.isMouthOpen };
+        return { ...p, position: newPosition, direction: currentDirection, isMouthOpen: !p.isMouthOpen };
     });
   }, [board]);
 
   const moveGhosts = useCallback(() => {
-      setGhosts(currentGhosts => currentGhosts.map(ghost => {
-          const opposite: Record<Direction, Direction> = {
-              [Direction.UP]: Direction.DOWN,
-              [Direction.DOWN]: Direction.UP,
-              [Direction.LEFT]: Direction.RIGHT,
-              [Direction.RIGHT]: Direction.LEFT,
-              [Direction.NONE]: Direction.NONE
-          };
-
-          // Eaten ghosts path back to their spawn point
-          if (ghost.state === 'eaten') {
-              if (ghost.position.x === ghost.spawn.x && ghost.position.y === ghost.spawn.y) {
-                  return { ...ghost, state: 'normal', direction: Direction.UP };
-              }
-              const nextDir = findNextMove(board, ghost.position, ghost.spawn, ghost.state);
-              return { ...ghost, position: getNextPosition(ghost.position, nextDir ?? opposite[ghost.direction]), direction: nextDir ?? ghost.direction };
-          }
-          
-          const possibleDirections: Direction[] = [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT]
-              .filter(dir => dir !== opposite[ghost.direction]);
-
-          let availableMoves = possibleDirections.filter(dir => {
-              const nextPos = getNextPosition(ghost.position, dir);
-              const cell = board[nextPos.y]?.[nextPos.x];
-              return cell !== CellType.WALL && (ghost.state === 'eaten' ? true : cell !== CellType.GHOST_HOME);
-          });
-          
-          if (availableMoves.length === 0) {
-             availableMoves = [opposite[ghost.direction]]; // Must reverse if trapped
-          }
-
-          let bestDir: Direction;
-
-          if (ghost.state === 'frightened') {
-              bestDir = availableMoves[Math.floor(Math.random() * availableMoves.length)];
-          } else {
-              const targetPos = (ghostMode === 'chase' && geminiTargets && geminiTargets[ghost.id]) 
-                ? geminiTargets[ghost.id] 
-                : (ghostMode === 'chase' ? getChaseTarget(ghost, pacman, currentGhosts) : ghost.scatterTarget);
-              
-              const pathfindingDir = findNextMove(board, ghost.position, targetPos, ghost.state);
-              
-              if (pathfindingDir && availableMoves.includes(pathfindingDir)) {
-                  bestDir = pathfindingDir;
-              } else {
-                  // If path is blocked or not in available moves, pick a random available one.
-                  // This prevents getting stuck on suboptimal pathfinding results.
-                  bestDir = availableMoves[Math.floor(Math.random() * availableMoves.length)];
-              }
-          }
-          
-          return {
-              ...ghost,
-              position: getNextPosition(ghost.position, bestDir),
-              direction: bestDir,
-          };
-      }));
+    setGhosts(currentGhosts => currentGhosts.map(ghost => {
+      const opposite: Record<Direction, Direction> = {
+        [Direction.UP]: Direction.DOWN,
+        [Direction.DOWN]: Direction.UP,
+        [Direction.LEFT]: Direction.RIGHT,
+        [Direction.RIGHT]: Direction.LEFT,
+        [Direction.NONE]: Direction.NONE
+      };
+  
+      // 1) Returning home (eaten) — path to spawn
+      if (ghost.state === 'eaten') {
+        if (ghost.position.x === ghost.spawn.x && ghost.position.y === ghost.spawn.y) {
+          return { ...ghost, state: 'normal', direction: Direction.UP };
+        }
+        const nextDir = findNextMove(board, ghost.position, ghost.spawn, ghost.state);
+        const step = nextDir
+          ? safeGhostStep(ghost.position, nextDir, board, ghost.state)
+          : tryGhostMoves(ghost.position, [opposite[ghost.direction], ghost.direction], board, ghost.state);
+        return step ? { ...ghost, position: step.pos, direction: step.dir } : ghost;
+      }
+  
+      // 2) Frightened — bias away from Pac-Man but never into walls
+      if (ghost.state === 'frightened') {
+        const dirs: Direction[] = [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT];
+        // simple heuristic: prefer not to reverse unless forced
+        const prio = dirs.filter(d => d !== opposite[ghost.direction]).concat(opposite[ghost.direction]);
+        const step = tryGhostMoves(ghost.position, prio, board, ghost.state);
+        return step ? { ...ghost, position: step.pos, direction: step.dir } : ghost;
+      }
+  
+      // 3) Normal (chase or scatter) — compute target, then pathfind
+      const targetPos = (ghostMode === 'chase' && geminiTargets && geminiTargets[ghost.id])
+        ? geminiTargets[ghost.id]
+        : (ghostMode === 'chase' ? getChaseTarget(ghost, pacman, currentGhosts) : ghost.scatterTarget);
+  
+      const bestDir = findNextMove(board, ghost.position, targetPos, ghost.state);
+  
+      // Candidate order: bestDir, keep current, 90-degree turns, finally reverse
+      const turns = ghost.direction === Direction.UP || ghost.direction === Direction.DOWN
+        ? [Direction.LEFT, Direction.RIGHT]
+        : [Direction.UP, Direction.DOWN];
+  
+      const candidates: Direction[] = [];
+      if (bestDir) candidates.push(bestDir);
+      candidates.push(ghost.direction, ...turns, opposite[ghost.direction]);
+  
+      const step = tryGhostMoves(ghost.position, candidates, board, ghost.state);
+      return step ? { ...ghost, position: step.pos, direction: step.dir } : ghost;
+    }));
   }, [board, pacman, ghostMode, geminiTargets]);
   
   // Game Loop
